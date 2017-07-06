@@ -21,6 +21,7 @@ import (
 
 	"github.com/hashicorp/consul/agent/config"
 	"github.com/hashicorp/consul/agent/dns"
+	"github.com/hashicorp/consul/agent/lstate"
 	"github.com/hashicorp/consul/agent/rpc"
 	"github.com/hashicorp/consul/agent/structs"
 	"github.com/hashicorp/consul/agent/systemd"
@@ -104,7 +105,7 @@ type Agent struct {
 
 	// state stores a local representation of the node,
 	// services and checks. Used for anti-entropy.
-	state *localState
+	state *lstate.State
 
 	// checkReapAfter maps the check ID to a timeout after which we should
 	// reap its associated service
@@ -289,7 +290,21 @@ func (a *Agent) Start() error {
 	}
 
 	// create the local state
-	a.state = NewLocalState(c, a.logger)
+	lc := lstate.Config{
+		ACLToken:            c.ACLToken,
+		AEInterval:          c.AEInterval,
+		AdvertiseAddr:       c.AdvertiseAddr,
+		CheckUpdateInterval: c.CheckUpdateInterval,
+		Datacenter:          c.Datacenter,
+		NodeID:              c.NodeID,
+		NodeName:            c.NodeName,
+		TaggedAddresses:     map[string]string{},
+		TokenForAgent:       c.GetTokenForAgent(),
+	}
+	for k, v := range c.TaggedAddresses {
+		lc.TaggedAddresses[k] = v
+	}
+	a.state = lstate.NewState(lc, a.logger)
 
 	// create the config for the rpc server/client
 	consulCfg, err := a.consulConfig()
@@ -308,7 +323,7 @@ func (a *Agent) Start() error {
 		}
 
 		a.delegate = server
-		a.state.delegate = server
+		a.state.SetDelegate(server)
 
 		// Automatically register the "consul" service on server nodes
 		consulService := structs.NodeService{
@@ -326,7 +341,7 @@ func (a *Agent) Start() error {
 		}
 
 		a.delegate = client
-		a.state.delegate = client
+		a.state.SetDelegate(client)
 	}
 
 	// Load checks/services/metadata.
@@ -1280,7 +1295,7 @@ func (a *Agent) WANMembers() []serf.Member {
 // This is called to prevent a race between clients and the anti-entropy routines
 func (a *Agent) StartSync() {
 	// Start the anti entropy routine
-	go a.state.antiEntropy(a.shutdownCh)
+	go a.state.AntiEntropy(a.shutdownCh)
 }
 
 // PauseSync is used to pause anti-entropy while bulk changes are make
@@ -1934,8 +1949,10 @@ func (a *Agent) Stats() map[string]map[string]string {
 	stats["agent"] = map[string]string{
 		"check_monitors": toString(uint64(len(a.checkMonitors))),
 		"check_ttls":     toString(uint64(len(a.checkTTLs))),
-		"checks":         toString(uint64(len(a.state.checks))),
-		"services":       toString(uint64(len(a.state.services))),
+	}
+
+	for k, v := range a.state.Stats() {
+		stats["agent"][k] = v
 	}
 
 	revision := a.config.Revision
@@ -2049,7 +2066,7 @@ func (a *Agent) loadServices(cfg *config.Config) error {
 		}
 		serviceID := p.Service.ID
 
-		if _, ok := a.state.services[serviceID]; ok {
+		if a.state.Service(serviceID) != nil {
 			// Purge previously persisted service. This allows config to be
 			// preferred over services persisted from the API.
 			a.logger.Printf("[DEBUG] agent: service %q exists, not restoring from %q",
@@ -2132,7 +2149,7 @@ func (a *Agent) loadChecks(cfg *config.Config) error {
 		}
 		checkID := p.Check.CheckID
 
-		if _, ok := a.state.checks[checkID]; ok {
+		if a.state.Check(checkID) != nil {
 			// Purge previously persisted check. This allows config to be
 			// preferred over persisted checks from the API.
 			a.logger.Printf("[DEBUG] agent: check %q exists, not restoring from %q",
@@ -2191,24 +2208,12 @@ func (a *Agent) restoreCheckState(snap map[types.CheckID]*structs.HealthCheck) {
 // loadMetadata loads node metadata fields from the agent config and
 // updates them on the local agent.
 func (a *Agent) loadMetadata(cfg *config.Config) error {
-	a.state.Lock()
-	defer a.state.Unlock()
-
-	for key, value := range cfg.Meta {
-		a.state.metadata[key] = value
-	}
-
-	a.state.changeMade()
-
-	return nil
+	return a.state.LoadMetadata(cfg.Meta)
 }
 
 // unloadMetadata resets the local metadata state
 func (a *Agent) unloadMetadata() {
-	a.state.Lock()
-	defer a.state.Unlock()
-
-	a.state.metadata = make(map[string]string)
+	a.state.UnloadMetadata()
 }
 
 // serviceMaintCheckID returns the ID of a given service's maintenance check

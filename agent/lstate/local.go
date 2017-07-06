@@ -1,20 +1,21 @@
-package agent
+package lstate
 
 import (
 	"fmt"
 	"log"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/hashicorp/consul/agent/config"
 	"github.com/hashicorp/consul/agent/rpc"
 	"github.com/hashicorp/consul/agent/structs"
 	"github.com/hashicorp/consul/api"
 	"github.com/hashicorp/consul/lib"
 	"github.com/hashicorp/consul/types"
+	"github.com/hashicorp/serf/serf"
 )
 
 const (
@@ -22,16 +23,18 @@ const (
 	syncRetryIntv   = 15 * time.Second
 )
 
+var permissionDenied = "Permission denied"
+
 // syncStatus is used to represent the difference between
 // the local and remote state, and if action needs to be taken
 type syncStatus struct {
 	inSync bool // Is this in sync with the server
 }
 
-// localStateConfig is the configuration for the localState. It is
+// Config is the configuration for the State. It is
 // populated during NewLocalAgent from the agent configuration to avoid
 // race conditions with the agent configuration.
-type localStateConfig struct {
+type Config struct {
 	ACLToken            string
 	AEInterval          time.Duration
 	AdvertiseAddr       string
@@ -43,19 +46,23 @@ type localStateConfig struct {
 	TokenForAgent       string
 }
 
-// localState is used to represent the node's services,
+type delegate interface {
+	LANMembers() []serf.Member
+	RPC(method string, args interface{}, reply interface{}) error
+}
+
+// State is used to represent the node's services,
 // and checks. We used it to perform anti-entropy with the
 // catalog representation
-type localState struct {
+type State struct {
 	// paused is used to check if we are paused. Must be the first
 	// element due to a go bug.
 	paused int32
 
-	sync.RWMutex
 	logger *log.Logger
 
-	// Config is the agent config
-	config localStateConfig
+	// Config is the state config
+	config Config
 
 	// delegate is the consul interface to use for keeping in sync
 	delegate delegate
@@ -63,6 +70,11 @@ type localState struct {
 	// nodeInfoInSync tracks whether the server has our correct top-level
 	// node information in sync
 	nodeInfoInSync bool
+
+	// mu is an explicit lock that guards the data structures
+	// below. It is a member instead of being embedded to prevent
+	// users of state to control the lock.
+	mu sync.RWMutex
 
 	// Services tracks the local services
 	services      map[string]*structs.NodeService
@@ -90,25 +102,10 @@ type localState struct {
 	triggerCh chan struct{}
 }
 
-// NewLocalState creates a  is used to initialize the local state
-func NewLocalState(c *config.Config, lg *log.Logger) *localState {
-	lc := localStateConfig{
-		ACLToken:            c.ACLToken,
-		AEInterval:          c.AEInterval,
-		AdvertiseAddr:       c.AdvertiseAddr,
-		CheckUpdateInterval: c.CheckUpdateInterval,
-		Datacenter:          c.Datacenter,
-		NodeID:              c.NodeID,
-		NodeName:            c.NodeName,
-		TaggedAddresses:     map[string]string{},
-		TokenForAgent:       c.GetTokenForAgent(),
-	}
-	for k, v := range c.TaggedAddresses {
-		lc.TaggedAddresses[k] = v
-	}
-
-	return &localState{
-		config:            lc,
+// NewState creates a  is used to initialize the local state
+func NewState(c Config, lg *log.Logger) *State {
+	return &State{
+		config:            c,
 		logger:            lg,
 		services:          make(map[string]*structs.NodeService),
 		serviceStatus:     make(map[string]syncStatus),
@@ -124,8 +121,12 @@ func NewLocalState(c *config.Config, lg *log.Logger) *localState {
 	}
 }
 
+func (l *State) SetDelegate(d delegate) {
+	l.delegate = d
+}
+
 // changeMade is used to trigger an anti-entropy run
-func (l *localState) changeMade() {
+func (l *State) changeMade() {
 	select {
 	case l.triggerCh <- struct{}{}:
 	default:
@@ -135,7 +136,7 @@ func (l *localState) changeMade() {
 // ConsulServerUp is used to inform that a new consul server is now
 // up. This can be used to speed up the sync process if we are blocking
 // waiting to discover a consul server
-func (l *localState) ConsulServerUp() {
+func (l *State) ConsulServerUp() {
 	select {
 	case l.consulCh <- struct{}{}:
 	default:
@@ -144,34 +145,34 @@ func (l *localState) ConsulServerUp() {
 
 // Pause is used to pause state synchronization, this can be
 // used to make batch changes
-func (l *localState) Pause() {
+func (l *State) Pause() {
 	atomic.AddInt32(&l.paused, 1)
 }
 
 // Resume is used to resume state synchronization
-func (l *localState) Resume() {
+func (l *State) Resume() {
 	paused := atomic.AddInt32(&l.paused, -1)
 	if paused < 0 {
-		panic("unbalanced localState.Resume() detected")
+		panic("unbalanced State.Resume() detected")
 	}
 	l.changeMade()
 }
 
 // isPaused is used to check if we are paused
-func (l *localState) isPaused() bool {
+func (l *State) isPaused() bool {
 	return atomic.LoadInt32(&l.paused) > 0
 }
 
 // ServiceToken returns the configured ACL token for the given
 // service ID. If none is present, the agent's token is returned.
-func (l *localState) ServiceToken(id string) string {
-	l.RLock()
-	defer l.RUnlock()
+func (l *State) ServiceToken(id string) string {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
 	return l.serviceToken(id)
 }
 
 // serviceToken returns an ACL token associated with a service.
-func (l *localState) serviceToken(id string) string {
+func (l *State) serviceToken(id string) string {
 	token := l.serviceTokens[id]
 	if token == "" {
 		token = l.config.ACLToken
@@ -182,14 +183,14 @@ func (l *localState) serviceToken(id string) string {
 // AddService is used to add a service entry to the local state.
 // This entry is persistent and the agent will make a best effort to
 // ensure it is registered
-func (l *localState) AddService(service *structs.NodeService, token string) {
+func (l *State) AddService(service *structs.NodeService, token string) {
 	// Assign the ID if none given
 	if service.ID == "" && service.Service != "" {
 		service.ID = service.Service
 	}
 
-	l.Lock()
-	defer l.Unlock()
+	l.mu.Lock()
+	defer l.mu.Unlock()
 
 	l.services[service.ID] = service
 	l.serviceStatus[service.ID] = syncStatus{}
@@ -199,9 +200,9 @@ func (l *localState) AddService(service *structs.NodeService, token string) {
 
 // RemoveService is used to remove a service entry from the local state.
 // The agent will make a best effort to ensure it is deregistered
-func (l *localState) RemoveService(serviceID string) error {
-	l.Lock()
-	defer l.Unlock()
+func (l *State) RemoveService(serviceID string) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
 
 	if _, ok := l.services[serviceID]; ok {
 		delete(l.services, serviceID)
@@ -216,12 +217,28 @@ func (l *localState) RemoveService(serviceID string) error {
 	return nil
 }
 
+// Service returns the locally registered service that the
+// agent is aware of and are being kept in sync with the server
+func (l *State) ServiceStatus(id string) syncStatus {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	return l.serviceStatus[id]
+}
+
+// Service returns the locally registered service that the
+// agent is aware of and are being kept in sync with the server
+func (l *State) Service(id string) *structs.NodeService {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	return l.services[id]
+}
+
 // Services returns the locally registered services that the
 // agent is aware of and are being kept in sync with the server
-func (l *localState) Services() map[string]*structs.NodeService {
+func (l *State) Services() map[string]*structs.NodeService {
 	services := make(map[string]*structs.NodeService)
-	l.RLock()
-	defer l.RUnlock()
+	l.mu.RLock()
+	defer l.mu.RUnlock()
 
 	for name, serv := range l.services {
 		services[name] = serv
@@ -231,14 +248,14 @@ func (l *localState) Services() map[string]*structs.NodeService {
 
 // CheckToken is used to return the configured health check token for a
 // Check, or if none is configured, the default agent ACL token.
-func (l *localState) CheckToken(checkID types.CheckID) string {
-	l.RLock()
-	defer l.RUnlock()
+func (l *State) CheckToken(checkID types.CheckID) string {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
 	return l.checkToken(checkID)
 }
 
 // checkToken returns an ACL token associated with a check.
-func (l *localState) checkToken(checkID types.CheckID) string {
+func (l *State) checkToken(checkID types.CheckID) string {
 	token := l.checkTokens[checkID]
 	if token == "" {
 		token = l.config.ACLToken
@@ -249,12 +266,12 @@ func (l *localState) checkToken(checkID types.CheckID) string {
 // AddCheck is used to add a health check to the local state.
 // This entry is persistent and the agent will make a best effort to
 // ensure it is registered
-func (l *localState) AddCheck(check *structs.HealthCheck, token string) {
+func (l *State) AddCheck(check *structs.HealthCheck, token string) {
 	// Set the node name
 	check.Node = l.config.NodeName
 
-	l.Lock()
-	defer l.Unlock()
+	l.mu.Lock()
+	defer l.mu.Unlock()
 
 	l.checks[check.CheckID] = check
 	l.checkStatus[check.CheckID] = syncStatus{}
@@ -265,9 +282,9 @@ func (l *localState) AddCheck(check *structs.HealthCheck, token string) {
 
 // RemoveCheck is used to remove a health check from the local state.
 // The agent will make a best effort to ensure it is deregistered
-func (l *localState) RemoveCheck(checkID types.CheckID) {
-	l.Lock()
-	defer l.Unlock()
+func (l *State) RemoveCheck(checkID types.CheckID) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
 
 	delete(l.checks, checkID)
 	// Leave the check token around, if any, until we successfully delete
@@ -278,9 +295,9 @@ func (l *localState) RemoveCheck(checkID types.CheckID) {
 }
 
 // UpdateCheck is used to update the status of a check
-func (l *localState) UpdateCheck(checkID types.CheckID, status, output string) {
-	l.Lock()
-	defer l.Unlock()
+func (l *State) UpdateCheck(checkID types.CheckID, status, output string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
 
 	check, ok := l.checks[checkID]
 	if !ok {
@@ -312,13 +329,13 @@ func (l *localState) UpdateCheck(checkID types.CheckID, status, output string) {
 		if _, ok := l.deferCheck[checkID]; !ok {
 			intv := time.Duration(uint64(l.config.CheckUpdateInterval)/2) + lib.RandomStagger(l.config.CheckUpdateInterval)
 			deferSync := time.AfterFunc(intv, func() {
-				l.Lock()
+				l.mu.Lock()
 				if _, ok := l.checkStatus[checkID]; ok {
 					l.checkStatus[checkID] = syncStatus{inSync: false}
 					l.changeMade()
 				}
 				delete(l.deferCheck, checkID)
-				l.Unlock()
+				l.mu.Unlock()
 			})
 			l.deferCheck[checkID] = deferSync
 		}
@@ -332,12 +349,20 @@ func (l *localState) UpdateCheck(checkID types.CheckID, status, output string) {
 	l.changeMade()
 }
 
+// Check returns the locally registered checks that the
+// agent is aware of and are being kept in sync with the server
+func (l *State) Check(id types.CheckID) *structs.HealthCheck {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	return l.checks[id]
+}
+
 // Checks returns the locally registered checks that the
 // agent is aware of and are being kept in sync with the server
-func (l *localState) Checks() map[types.CheckID]*structs.HealthCheck {
+func (l *State) Checks() map[types.CheckID]*structs.HealthCheck {
 	checks := make(map[types.CheckID]*structs.HealthCheck)
-	l.RLock()
-	defer l.RUnlock()
+	l.mu.RLock()
+	defer l.mu.RUnlock()
 
 	for checkID, check := range l.checks {
 		checks[checkID] = check
@@ -356,11 +381,11 @@ type CriticalCheck struct {
 // aware of and are being kept in sync with the server, and that are in a
 // critical state. This also returns information about how long each check has
 // been critical.
-func (l *localState) CriticalChecks() map[types.CheckID]CriticalCheck {
+func (l *State) CriticalChecks() map[types.CheckID]CriticalCheck {
 	checks := make(map[types.CheckID]CriticalCheck)
 
-	l.RLock()
-	defer l.RUnlock()
+	l.mu.RLock()
+	defer l.mu.RUnlock()
 
 	now := time.Now()
 	for checkID, criticalTime := range l.checkCriticalTime {
@@ -375,10 +400,10 @@ func (l *localState) CriticalChecks() map[types.CheckID]CriticalCheck {
 
 // Metadata returns the local node metadata fields that the
 // agent is aware of and are being kept in sync with the server
-func (l *localState) Metadata() map[string]string {
+func (l *State) Metadata() map[string]string {
 	metadata := make(map[string]string)
-	l.RLock()
-	defer l.RUnlock()
+	l.mu.RLock()
+	defer l.mu.RUnlock()
 
 	for key, value := range l.metadata {
 		metadata[key] = value
@@ -386,9 +411,22 @@ func (l *localState) Metadata() map[string]string {
 	return metadata
 }
 
-// antiEntropy is a long running method used to perform anti-entropy
+// Stats is used to get various debugging state from the sub-systems
+func (l *State) Stats() map[string]string {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+
+	toString := func(v int) string { return strconv.FormatInt(int64(v), 10) }
+
+	return map[string]string{
+		"checks":   toString(len(l.checks)),
+		"services": toString(len(l.services)),
+	}
+}
+
+// AntiEntropy is a long running method used to perform anti-entropy
 // between local and remote state.
-func (l *localState) antiEntropy(shutdownCh chan struct{}) {
+func (l *State) AntiEntropy(shutdownCh chan struct{}) {
 SYNC:
 	// Sync our state with the servers
 	for {
@@ -429,7 +467,7 @@ SYNC:
 			if l.isPaused() {
 				continue
 			}
-			if err := l.syncChanges(); err != nil {
+			if err := l.SyncChanges(); err != nil {
 				l.logger.Printf("[ERR] agent: failed to sync changes: %v", err)
 			}
 		case <-shutdownCh:
@@ -440,7 +478,7 @@ SYNC:
 
 // setSyncState does a read of the server state, and updates
 // the local syncStatus as appropriate
-func (l *localState) setSyncState() error {
+func (l *State) setSyncState() error {
 	req := structs.NodeSpecificRequest{
 		Datacenter:   l.config.Datacenter,
 		Node:         l.config.NodeName,
@@ -456,8 +494,8 @@ func (l *localState) setSyncState() error {
 	}
 	checks := out2.HealthChecks
 
-	l.Lock()
-	defer l.Unlock()
+	l.mu.Lock()
+	defer l.mu.Unlock()
 
 	// Check the node info
 	if out1.NodeServices == nil || out1.NodeServices.Node == nil ||
@@ -559,11 +597,11 @@ func (l *localState) setSyncState() error {
 	return nil
 }
 
-// syncChanges is used to scan the status our local services and checks
+// SyncChanges is used to scan the status our local services and checks
 // and update any that are out of sync with the server
-func (l *localState) syncChanges() error {
-	l.Lock()
-	defer l.Unlock()
+func (l *State) SyncChanges() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
 
 	// We will do node-level info syncing at the end, since it will get
 	// updated by a service or check sync anyway, given how the register
@@ -576,7 +614,7 @@ func (l *localState) syncChanges() error {
 				return err
 			}
 		} else if !status.inSync {
-			if err := l.syncService(id); err != nil {
+			if err := l.SyncService(id); err != nil {
 				return err
 			}
 		} else {
@@ -619,7 +657,7 @@ func (l *localState) syncChanges() error {
 }
 
 // deleteService is used to delete a service from the server
-func (l *localState) deleteService(id string) error {
+func (l *State) deleteService(id string) error {
 	if id == "" {
 		return fmt.Errorf("ServiceID missing")
 	}
@@ -646,7 +684,7 @@ func (l *localState) deleteService(id string) error {
 }
 
 // deleteCheck is used to delete a check from the server
-func (l *localState) deleteCheck(id types.CheckID) error {
+func (l *State) deleteCheck(id types.CheckID) error {
 	if id == "" {
 		return fmt.Errorf("CheckID missing")
 	}
@@ -672,8 +710,8 @@ func (l *localState) deleteCheck(id types.CheckID) error {
 	return err
 }
 
-// syncService is used to sync a service to the server
-func (l *localState) syncService(id string) error {
+// SyncService is used to sync a service to the server
+func (l *State) SyncService(id string) error {
 	req := structs.RegisterRequest{
 		Datacenter:      l.config.Datacenter,
 		ID:              l.config.NodeID,
@@ -730,7 +768,7 @@ func (l *localState) syncService(id string) error {
 }
 
 // syncCheck is used to sync a check to the server
-func (l *localState) syncCheck(id types.CheckID) error {
+func (l *State) syncCheck(id types.CheckID) error {
 	// Pull in the associated service if any
 	check := l.checks[id]
 	var service *structs.NodeService
@@ -767,7 +805,7 @@ func (l *localState) syncCheck(id types.CheckID) error {
 	return err
 }
 
-func (l *localState) syncNodeInfo() error {
+func (l *State) syncNodeInfo() error {
 	req := structs.RegisterRequest{
 		Datacenter:      l.config.Datacenter,
 		ID:              l.config.NodeID,
@@ -788,4 +826,24 @@ func (l *localState) syncNodeInfo() error {
 		return nil
 	}
 	return err
+}
+
+// loadMetadata loads node metadata fields from the agent config and
+// updates them on the local agent.
+func (l *State) LoadMetadata(meta map[string]string) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	for k, v := range meta {
+		l.metadata[k] = v
+	}
+	l.changeMade()
+	return nil
+}
+
+// UnloadMetadata resets the local metadata state
+func (l *State) UnloadMetadata() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.metadata = make(map[string]string)
 }

@@ -1,10 +1,11 @@
-package agent
+package lstate_test
 
 import (
 	"reflect"
 	"testing"
 	"time"
 
+	"github.com/hashicorp/consul/agent"
 	"github.com/hashicorp/consul/agent/config"
 	"github.com/hashicorp/consul/agent/structs"
 	"github.com/hashicorp/consul/api"
@@ -14,7 +15,7 @@ import (
 
 func TestAgentAntiEntropy_Services(t *testing.T) {
 	t.Parallel()
-	a := &TestAgent{Name: t.Name(), NoInitialSync: true}
+	a := &agent.TestAgent{Name: t.Name(), NoInitialSync: true}
 	a.Start()
 	defer a.Shutdown()
 
